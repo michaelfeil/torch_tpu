@@ -577,9 +577,38 @@ def run_scatter_mismatch_input_shapes() -> None:
   # Intentionally do NOT call scatter on non-root ranks.
 
 
+def run_async_work_wait_timeout() -> None:
+  """Tests that Work.wait(timeout) raises when the collective times out."""
+  rank = dist.get_rank()
+  store = dist.distributed_c10d._get_default_store()
+  gate_key = "async_work_wait_timeout_rank0_checked"
+  x = torch.ones((4,), dtype=torch.float32, device="tpu")
+  dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=True).wait()
+  torch.accelerator.synchronize()
+  dist.barrier()
+
+  if rank == 0:
+    work = dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=True)
+    with et.assert_raises_message(
+        RuntimeError, tpu="""timed out waiting for collective after 10 ms"""
+    ):
+      work.wait(datetime.timedelta(milliseconds=10))
+    store.set(gate_key, "1")
+  else:
+    store.wait([gate_key])
+    work = dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=True)
+
+  work.wait()
+  torch.accelerator.synchronize()
+  dist.barrier()
+  if rank == 0:
+    store.delete_key(gate_key)
+
+
 def run_collective_validation_errors() -> None:
   """Runs synchronous collective input validation error checks."""
   run_all_reduce_error()
+  run_async_work_wait_timeout()
   run_all_gather_tensor_wrong_number_output_dimensions()
   run_all_gather_tensor_wrong_concat_dimension()
   run_all_gather_tensor_wrong_stack_dimension()
