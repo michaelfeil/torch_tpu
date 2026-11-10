@@ -127,6 +127,7 @@ def _convert_shape(shape, mesh, partition_spec, op):
   """Converts a shape based on a mesh and partition specification."""
   if mesh is not None and partition_spec is not None:
     mesh_shape = mesh.shape
+    unconstrained = getattr(jax.sharding.PartitionSpec, "UNCONSTRAINED", None)
     ans = tuple(
         [
             op(
@@ -136,6 +137,7 @@ def _convert_shape(shape, mesh, partition_spec, op):
                 else mesh_shape[name],
             )
             if name is not None
+            and (unconstrained is None or name is not unconstrained)
             else s
             for s, name in zip(shape, partition_spec)
         ]
@@ -1627,8 +1629,9 @@ def jax_op(
 
   If arguments are donated those tensors will be left in an invalid state after
   the kernel is called and should not be used again. Consider using a wrapper
-  function and copy_ or set_ to overwrite these invalid tensors to prevent
-  accidental reuse.
+  function and `set_` (not `copy_`, which writes into the invalidated storage)
+  to repoint donated tensors to the returned buffer and prevent accidental
+  reuse.
 
   Args:
     name: The name of the custom operator.

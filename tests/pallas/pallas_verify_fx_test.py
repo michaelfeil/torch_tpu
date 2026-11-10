@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import operator
+import threading
 import types
 
 from absl.testing import absltest
@@ -1313,6 +1314,589 @@ class FxVerifierTest(seed_test_utils.RepeatableTest):
         sc_op, (torch.ones((8, 128), dtype=torch.float32),), mode=STATIC
     )
     self.assertTrue(rep.passed, msg=rep.summary())
+
+  def test_docstring_negation_and_comments_ignored_in_tpu_inference(self):
+    def _tc_only_fn(x: jax.Array) -> jax.Array:
+      """Runs on TPU v6e TensorCore (does not use SparseCore)."""
+      # Note: pltpu.sparse_core on v5e/v5p is not used here.
+      return _pallas_add_one(x)
+
+    def _sc_real_fn(x: jax.Array) -> jax.Array:
+      _ = (
+          getattr(pltpu, "sparse_core", None)
+          or pltpu.CoreType.SC_SCALAR_SUBCORE
+      )
+      # Keep real attribute punctuation:
+      if hasattr(pltpu, "sparse_core"):
+        _ = pltpu.sparse_core
+      return _pallas_add_one(x)
+
+    self.assertFalse(fx_verifier._function_uses_sparse_core(_tc_only_fn))
+    self.assertTrue(fx_verifier._function_uses_sparse_core(_sc_real_fn))
+    self.assertEqual(
+        fx_verifier._extract_doc_tpu_versions(
+            "Optimized for TPU v6e; baseline compared against TPU v5e."
+        ),
+        [torch.tpu.TpuVersion.V6E, torch.tpu.TpuVersion.V5E],
+    )
+    self.assertIs(
+        fx_verifier.infer_tpu_version(_tc_only_fn), torch.tpu.TpuVersion.V6E
+    )
+    self.assertEqual(fx_verifier.abstract_tpu_device("v5p").num_cores, 2)
+    self.assertEqual(fx_verifier.abstract_tpu_device("v6e").num_cores, 1)
+
+  def test_integer_tensor_signature_and_concrete_fx_propagation(self):
+    i0 = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    i1 = torch.tensor([0, 1, 2, 99], dtype=torch.int32)
+    self.assertNotEqual(
+        verifier_impl._signature(i0), verifier_impl._signature(i1)
+    )
+    large0 = torch.zeros((4097,), dtype=torch.int32)
+    large1 = large0.clone()
+    large1[-1] = 7
+    self.assertNotEqual(
+        verifier_impl._signature(large0), verifier_impl._signature(large1)
+    )
+
+    def _mutating_and_pure_prog(
+        x: torch.Tensor, caller_idx: torch.Tensor
+    ) -> torch.Tensor:
+      counts = torch.tensor([1, 1, 1, 1], dtype=torch.int32)
+      offsets = torch.cumsum(counts, dim=0, dtype=torch.int32) - 1
+      uninit_buf = torch.empty((4,), dtype=torch.int32)
+      uninit_buf.fill_(0)
+      caller_view = caller_idx.view(-1)
+      caller_view.copy_(offsets)
+      return x + offsets[0] + uninit_buf[0] + caller_idx[0]
+
+    x = torch.ones((8, 128), dtype=torch.float32)
+    caller_idx = torch.tensor([99, 99, 99, 99], dtype=torch.int32)
+    gm = fx_verifier.trace_to_fx_graph(_mutating_and_pure_prog, (x, caller_idx))
+    phs = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    ph_env = fx_verifier.match_placeholders_to_inputs(
+        phs, (x, caller_idx), None
+    )
+    _, env = verifier_impl._collect_graph_module_envs(gm, ph_env)[0]
+    # `torch.empty` is never evaluated to heap garbage, and in-place mutation of
+    # `caller_view` invalidates the aliased `caller_idx` placeholder entry.
+    self.assertTrue(
+        all(
+            not (
+                isinstance(v, torch.Tensor)
+                and v.shape == (4,)
+                and torch.equal(v, torch.tensor([99, 99, 99, 99]))
+            )
+            for v in env.values()
+        )
+    )
+    self.assertTrue(
+        any(
+            isinstance(v, torch.Tensor)
+            and torch.equal(v, torch.tensor([0, 1, 2, 3], dtype=torch.int32))
+            for v in env.values()
+        )
+    )
+    self.assertTrue(
+        all(
+            verifier_impl._fx_node_base_op_name(n) != "empty"
+            for n in env
+            if n.op == "call_function"
+        )
+    )
+
+  def test_joint_autograd_detects_saved_activation_donated_later(self):
+    donating_binary = jax_op(
+        "pallas_verify_fx::joint_saved_donor",
+        _pallas_binary_add,
+        donate_argnums=(1,),
+    )
+    donating_binary.register_autograd(lambda ctx, g: (g, g))
+
+    class _SavedThenDonated(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(
+            torch.ones((8, 128), dtype=torch.float32)
+        )
+
+      def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x * self.scale
+        # `h * h` saves `h` on the standard PyTorch autograd tape, and then
+        # `donating_binary` donates `h` in the same forward pass!
+        sq = h * h
+        return donating_binary(sq, h)
+
+    mod = _SavedThenDonated()
+    x = torch.ones((8, 128), dtype=torch.float32, requires_grad=True)
+    rep = verifier.verify(mod, (x,), mode=STATIC)
+    self.assertFalse(rep.passed, msg=rep.summary())
+    donate_findings = rep.findings_by_category(Category.USE_AFTER_DONATE)
+    self.assertNotEmpty(donate_findings, msg=rep.summary())
+    self.assertTrue(
+        any("autograd backward" in f.message for f in donate_findings),
+        msg=rep.summary(),
+    )
+
+    broken_bwd_donor = jax_op(
+        "pallas_verify_fx::joint_broken_bwd_donor",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+
+    def _broken_bwd(ctx, g):
+      del ctx, g
+      raise RuntimeError("synthetic untraceable backward failure")
+
+    broken_bwd_donor.register_autograd(_broken_bwd)
+    inc_rep = verifier.verify(
+        lambda t: broken_bwd_donor(t * 2.0), (x,), mode=STATIC
+    )
+    inc_findings = [
+        f
+        for f in inc_rep.findings_by_category(Category.VERIFICATION_INCOMPLETE)
+        if f.phase == verifier.Phase.FX_GRAPH
+    ]
+    self.assertNotEmpty(inc_findings, msg=inc_rep.summary())
+    self.assertEqual(inc_findings[0].severity, verifier.Severity.WARNING)
+
+    # A forward-only `@jax_op` without `register_autograd` must NOT emit a
+    # spurious `VERIFICATION_INCOMPLETE` warning when `x.requires_grad=True`,
+    # and must not mask a differentiable output's saved-activation donation bug.
+    fwd_only_donor = jax_op(
+        "pallas_verify_fx::joint_fwd_only_donor",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+    fwd_only_rep = verifier.verify(
+        lambda t: fwd_only_donor(t.clone()), (x,), mode=STATIC
+    )
+    fwd_only_rep.raise_for_errors(fail_on_incomplete=True)
+
+    def _mixed_loss_and_fwd_only(t: torch.Tensor):
+      h = t * 2.0
+      sq = h * h
+      donated_res = donating_binary(sq, h)
+      aux = fwd_only_donor(t.detach().clone())
+      return donated_res, aux
+
+    mixed_rep = verifier.verify(_mixed_loss_and_fwd_only, (x,), mode=STATIC)
+    self.assertTrue(
+        any(
+            "autograd backward" in f.message
+            for f in mixed_rep.findings_by_category(Category.USE_AFTER_DONATE)
+        ),
+        msg=mixed_rep.summary(),
+    )
+
+  def test_fx_higher_order_cond_donation_and_nested_jax_op(self):
+    donating_op = jax_op(
+        "pallas_verify_fx::cond_donate_branch",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+
+    def _unaligned_pallas(arr: jax.Array) -> jax.Array:
+      return pl.pallas_call(
+          lambda x_ref, o_ref: o_ref.__setitem__(Ellipsis, x_ref[...] + 1.0),
+          out_shape=jax.ShapeDtypeStruct(arr.shape, arr.dtype),
+          in_specs=[pl.BlockSpec((8, 64), lambda i: (0, i))],
+          out_specs=pl.BlockSpec((8, 64), lambda i: (0, i)),
+          grid=(2,),
+      )(arr)
+
+    nested_bad_lowering_op = jax_op(
+        "pallas_verify_fx::cond_nested_bad_lowering",
+        _unaligned_pallas,
+    )
+    step_op = jax_op("pallas_verify_fx::scan_step_add_one", _pallas_add_one)
+
+    def cond_use_after_donate(
+        pred: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+      y = torch.cond(
+          pred,
+          lambda t: donating_op(t),
+          lambda t: t.clone(),
+          (x,),
+      )
+      return y + x
+
+    def cond_nested_bad_lowering(
+        pred: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+      return torch.cond(
+          pred,
+          lambda t: t.clone(),
+          lambda t: nested_bad_lowering_op(t),
+          (x,),
+      )
+
+    def while_loop_donate_additional_input(x: torch.Tensor) -> torch.Tensor:
+      from torch._higher_order_ops.while_loop import while_loop_op  # pylint: disable=g-import-not-at-top
+
+      i0 = torch.tensor(0, dtype=torch.int32)
+      acc0 = torch.zeros_like(x)
+      _, out_acc = while_loop_op(
+          lambda step, acc, shared: step < 2,
+          lambda step, acc, shared: (step + 1, acc + donating_op(shared)),
+          (i0, acc0),
+          (x,),
+      )
+      return out_acc
+
+    def scan_donate_additional_input(
+        xs_seq: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+      from torch._higher_order_ops.scan import scan_op  # pylint: disable=g-import-not-at-top
+
+      acc0 = torch.zeros_like(x)
+      final_carry, ys = scan_op(
+          lambda carry, x_slice, shared: (
+              carry + step_op(x_slice),
+              donating_op(shared),
+          ),
+          [acc0],
+          [xs_seq],
+          (x,),
+      )
+      return final_carry + ys[0]
+
+    pred = torch.tensor(True)
+    x = torch.ones((8, 128), dtype=torch.float32)
+    xs_seq = torch.ones((2, 8, 128), dtype=torch.float32)
+    donate_rep = verifier.verify(cond_use_after_donate, (pred, x), mode=STATIC)
+    self.assertNotEmpty(
+        donate_rep.findings_by_category(Category.USE_AFTER_DONATE),
+        msg=donate_rep.summary(),
+    )
+
+    while_rep = verifier.verify(
+        while_loop_donate_additional_input, (x,), mode=STATIC
+    )
+    self.assertNotEmpty(
+        while_rep.findings_by_category(Category.USE_AFTER_DONATE),
+        msg=while_rep.summary(),
+    )
+
+    scan_rep = verifier.verify(
+        scan_donate_additional_input, (xs_seq, x), mode=STATIC
+    )
+    self.assertNotEmpty(
+        scan_rep.findings_by_category(Category.USE_AFTER_DONATE),
+        msg=scan_rep.summary(),
+    )
+
+    lowering_rep = verifier.verify(
+        cond_nested_bad_lowering, (pred, x), mode=STATIC
+    )
+    self.assertNotEmpty(
+        lowering_rep.findings_by_category(Category.LOWERING_FAILURE),
+        msg=lowering_rep.summary(),
+    )
+
+  def test_multi_output_aminmax_out_and_set_inplace_provenance(self):
+    donating_op = jax_op(
+        "pallas_verify_fx::multi_out_and_set_donate",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+
+    def aminmax_disjoint_out(x: torch.Tensor) -> torch.Tensor:
+      min_buf = torch.empty((8, 128), dtype=x.dtype)
+      max_buf = torch.empty((8, 128), dtype=x.dtype)
+      lo, hi = torch.aminmax(
+          x, dim=-1, keepdim=True, out=(min_buf[:, :1], max_buf[:, :1])
+      )
+      del lo, hi
+      out = donating_op(min_buf)
+      return out + max_buf
+
+    def safe_set_rebind(x: torch.Tensor) -> torch.Tensor:
+      buf = x.clone()
+      fresh = donating_op(buf)
+      buf.set_(fresh)
+      return buf + 1.0
+
+    def buggy_set_shared_donate(x: torch.Tensor) -> torch.Tensor:
+      alias_holder = torch.empty_like(x)
+      donor = x.clone()
+      alias_holder.set_(donor)
+      out = donating_op(donor)
+      return out + alias_holder
+
+    x = torch.ones((8, 128), dtype=torch.float32)
+    aminmax_rep = verifier.verify(aminmax_disjoint_out, (x,), mode=STATIC)
+    self.assertTrue(aminmax_rep.passed, msg=aminmax_rep.summary())
+
+    safe_set_rep = verifier.verify(safe_set_rebind, (x,), mode=STATIC)
+    self.assertTrue(safe_set_rep.passed, msg=safe_set_rep.summary())
+
+    buggy_set_rep = verifier.verify(buggy_set_shared_donate, (x,), mode=STATIC)
+    self.assertNotEmpty(
+        buggy_set_rep.findings_by_category(Category.USE_AFTER_DONATE),
+        msg=buggy_set_rep.summary(),
+    )
+
+  def test_io_aliases_exempt_from_donor_invalidation_and_catch_self_alias(self):
+    io_alias_only = jax_op(
+        "pallas_verify_fx::io_alias_only",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+    io_alias_jc = fx_verifier.extract_jax_callable(io_alias_only)
+    self.assertIsNotNone(io_alias_jc)
+    io_alias_jc.input_output_aliases = {0: 0}
+
+    io_alias_binary = jax_op(
+        "pallas_verify_fx::io_alias_binary",
+        _pallas_binary_add,
+        donate_argnums=(0, 1),
+    )
+    io_alias_bin_jc = fx_verifier.extract_jax_callable(io_alias_binary)
+    self.assertIsNotNone(io_alias_bin_jc)
+    io_alias_bin_jc.input_output_aliases = {0: 0}
+
+    class _IoAliasParamModule(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones((8, 128), dtype=torch.float32))
+
+      def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = io_alias_only(self.w)
+        return y + self.w + x
+
+    x = torch.ones((8, 128), dtype=torch.float32)
+    ok_rep = verifier.verify(_IoAliasParamModule(), (x,), mode=STATIC)
+    self.assertTrue(ok_rep.passed, msg=ok_rep.summary())
+
+    def self_aliased(t: torch.Tensor) -> torch.Tensor:
+      return io_alias_binary(t, t.view(8, 128))
+
+    bad_rep = verifier.verify(self_aliased, (x,), mode=STATIC)
+    self.assertNotEmpty(
+        bad_rep.findings_by_category(Category.ALIASED_DONOR_INPUTS),
+        msg=bad_rep.summary(),
+    )
+
+  def test_module_state_preserved_and_aliased_buffer_input_detected(self):
+    donating_op = jax_op(
+        "pallas_verify_fx::module_state_donate",
+        _pallas_add_one,
+        donate_argnums=(0,),
+    )
+
+    class _StatefulModule(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "running_buf", torch.zeros((8, 128), dtype=torch.float32)
+        )
+        self.step_count = 0
+
+      def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.step_count += 1
+        self.running_buf.add_(1.0)
+        return donating_op(x) + self.running_buf
+
+    mod = _StatefulModule()
+    x = torch.ones((8, 128), dtype=torch.float32)
+    clean_rep = verifier.verify(mod, (x.clone(),), mode=STATIC)
+    self.assertTrue(clean_rep.passed, msg=clean_rep.summary())
+    self.assertEqual(mod.step_count, 0)
+    self.assertTrue(
+        torch.equal(mod.running_buf, torch.zeros((8, 128), dtype=torch.float32))
+    )
+
+    aliased_rep = verifier.verify(mod, (mod.running_buf,), mode=STATIC)
+    self.assertNotEmpty(
+        aliased_rep.findings_by_category(Category.DONATED_PARAMETER),
+        msg=aliased_rep.summary(),
+    )
+
+  def test_partition_spec_unconstrained_and_defaulted_trailing_static_arg(self):
+    mesh = jax.sharding.AbstractMesh((2,), ("tp",))
+    self.assertEmpty(
+        fx_verifier._validate_partition_spec_entry(
+            P(P.UNCONSTRAINED, "tp"),
+            2,
+            mesh,
+            "input 0",
+            "unconstrained_spec_op",
+        )
+    )
+    self.assertEqual(
+        pallas_lib.get_global_shape((8, 128), mesh, P(P.UNCONSTRAINED, "tp")),
+        (8, 256),
+    )
+
+    def _scaled_add(x: jax.Array, eps: float = 1e-5) -> jax.Array:
+      return jax.shard_map(
+          lambda s: _pallas_add_one(s) + eps,
+          mesh=mesh,
+          in_specs=(P("tp", None),),
+          out_specs=P("tp", None),
+          check_vma=False,
+      )(x)
+
+    sharded_op = jax_op(
+        "pallas_verify_fx::unconstrained_default_static",
+        _scaled_add,
+        mesh=mesh,
+        input_partition_specs=(P("tp", None),),
+        output_partition_specs=P("tp", None),
+    )
+
+    def caller(x: torch.Tensor) -> torch.Tensor:
+      return sharded_op(x)
+
+    x = torch.ones((8, 128), dtype=torch.float32)
+    rep = verifier.verify(caller, (x,), mode=STATIC)
+    self.assertTrue(rep.passed, msg=rep.summary())
+
+  def test_exported_fallback_hook_is_thread_local(self):
+    def _bad_lowering_fn(x: jax.Array) -> jax.Array:
+      def _bad_body(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+        raise ValueError("synthetic lowering failure")
+
+      return pl.pallas_call(
+          _bad_body, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype)
+      )(x)
+
+    bad_op = jax_op(
+        "pallas_verify_fx::thread_local_bad_export", _bad_lowering_fn
+    )
+    jc = fx_verifier.extract_jax_callable(bad_op)
+    self.assertIsNotNone(jc)
+    orig_exported = jc.exported
+    worker_errors: list[Exception] = []
+    ph = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+
+    with fx_verifier._eval_shape_fallback_for_jax_callables(bad_op):
+      # Calling thread gets the eval_shape fallback namespace.
+      fallback_res = jc.exported(ph)
+      self.assertEqual(fallback_res.out_avals[0].shape, (8, 128))
+
+      def _worker() -> None:
+        try:
+          jc.exported(ph)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+          worker_errors.append(exc)
+
+      t = threading.Thread(target=_worker)
+      t.start()
+      t.join()
+
+    # Concurrent worker thread saw the unpatched `exported` failure, and exiting
+    # the context restored `jc.exported`.
+    self.assertLen(worker_errors, 1)
+    self.assertIs(jc.exported, orig_exported)
+
+  def test_preconstructed_pallas_call_autograd_and_interior_tile_and_spmd(self):
+    params = pltpu.InterpretParams(dma_execution_mode="on_wait")
+    other_thread_saw_override: list[bool] = []
+    with fx_verifier.force_primitive_interpret_params(params):
+
+      def _check_worker() -> None:
+        stack = getattr(
+            fx_verifier._THREAD_PATCH_STATE, "interpret_params_stack", None
+        )
+        other_thread_saw_override.append(bool(stack))
+
+      worker = threading.Thread(target=_check_worker)
+      worker.start()
+      worker.join()
+    self.assertEqual(other_thread_saw_override, [False])
+
+    preconstructed_bwd = pl.pallas_call(
+        lambda g_ref, o_ref: o_ref.__setitem__(Ellipsis, g_ref[...] * 2.0),
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )
+
+    def _bwd_wrapper(g: jax.Array) -> jax.Array:
+      return preconstructed_bwd(g)
+
+    def _fwd_scale2_fn(x: jax.Array) -> jax.Array:
+      return pl.pallas_call(
+          lambda x_ref, o_ref: o_ref.__setitem__(Ellipsis, x_ref[...] * 2.0),
+          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+      )(x)
+
+    bwd_jax_op = jax_op("pallas_verify_fx::preconstructed_bwd", _bwd_wrapper)
+    fwd_scale2 = jax_op(
+        "pallas_verify_fx::fwd_scale2_preconstructed", _fwd_scale2_fn
+    )
+    fwd_scale2.register_autograd(lambda ctx, g: bwd_jax_op(g))
+    x_small = torch.randn((8, 128), dtype=torch.float32, requires_grad=True)
+    pre_rep = verifier.verify(fwd_scale2, (x_small,))
+    self.assertTrue(pre_rep.passed, msg=pre_rep.summary())
+    self.assertIn(verifier.Phase.AUTOGRAD, pre_rep.checked_phases)
+
+    # Interior-tile zero-gradient bug on (128, 128) bfloat16: rows 0:16 and
+    # 112:128 are exact, while interior rows 16:112 are zeroed out.
+    bf16_op = jax_op("pallas_verify_fx::interior_tile_bug_bf16", _fwd_scale2_fn)
+
+    def _buggy_interior_bwd(ctx, grad_out: torch.Tensor) -> torch.Tensor:
+      del ctx
+      g = grad_out * 2.0
+      g = g.clone()
+      g[16:112, :] = 0.0
+      return g
+
+    bf16_op.register_autograd(_buggy_interior_bwd)
+    x_bf16 = torch.randn((128, 128), dtype=torch.bfloat16, requires_grad=True)
+    bf16_rep = verifier.verify(bf16_op, (x_bf16,))
+    self.assertNotEmpty(
+        bf16_rep.findings_by_category(Category.AUTOGRAD_PARITY_MISMATCH),
+        msg=bf16_rep.summary(),
+    )
+
+    # Multi-device SPMD `all_gather` forward + `psum_scatter` (`reduce_scatter`)
+    # custom backward on a 2-device mesh.
+    tp_mesh = jax.sharding.AbstractMesh((2,), ("tp",))
+
+    def _ag_fwd_fn(x: jax.Array) -> jax.Array:
+      return jax.shard_map(
+          lambda s: jax.lax.all_gather(s, "tp", axis=0, tiled=True),
+          mesh=tp_mesh,
+          in_specs=(P("tp", None),),
+          out_specs=P(None, None),
+          check_vma=False,
+      )(x)
+
+    def _rs_bwd_fn(g: jax.Array) -> jax.Array:
+      return jax.shard_map(
+          lambda s: jax.lax.psum_scatter(
+              s, "tp", scatter_dimension=0, tiled=True
+          ),
+          mesh=tp_mesh,
+          in_specs=(P(None, None),),
+          out_specs=P("tp", None),
+          check_vma=False,
+      )(g)
+
+    ag_fwd = jax_op(
+        "pallas_verify_fx::spmd_all_gather_fwd",
+        _ag_fwd_fn,
+        mesh=tp_mesh,
+        input_partition_specs=(P("tp", None),),
+        output_partition_specs=P(None, None),
+    )
+    rs_bwd = jax_op(
+        "pallas_verify_fx::spmd_reduce_scatter_bwd",
+        _rs_bwd_fn,
+        mesh=tp_mesh,
+        input_partition_specs=(P(None, None),),
+        output_partition_specs=P("tp", None),
+    )
+    ag_fwd.register_autograd(lambda ctx, g: rs_bwd(g))
+    x_shard = torch.randn((8, 128), dtype=torch.float32, requires_grad=True)
+    spmd_rep = verifier.verify(ag_fwd, (x_shard,))
+    self.assertTrue(spmd_rep.passed, msg=spmd_rep.summary())
+    self.assertIn(verifier.Phase.AUTOGRAD, spmd_rep.checked_phases)
 
 
 if __name__ == "__main__":
