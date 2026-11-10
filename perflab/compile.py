@@ -44,6 +44,7 @@ class CompileConfig:
   scope: Scope = Scope.STEP
   dynamic: bool | None = None
   fullgraph: bool = False
+  spmd_safe: bool = False
 
   def apply(self, obj: Any, target: target_lib.Target) -> Callable:
     """Compile `obj` based on the target.
@@ -61,7 +62,13 @@ class CompileConfig:
     backend = "inductor"
     if target.device_kind is target_lib.DeviceKind.TPU:
       from torch_tpu._internal import compile as torch_tpu_compile  # pylint: disable=g-import-not-at-top
+      from torch_tpu._internal.distributed import spmd_util  # pylint: disable=g-import-not-at-top
 
+      if self.spmd_safe:
+        if isinstance(obj, torch.nn.Module):
+          obj.forward = spmd_util.spmd_safe(obj.forward)
+        else:
+          obj = spmd_util.spmd_safe(obj)
       backend = torch_tpu_compile.TpuBackend(dynamism=self.dynamic is not False)
     else:
       from perflab import device_utils  # pylint: disable=g-import-not-at-top

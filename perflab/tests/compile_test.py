@@ -41,6 +41,7 @@ class CompileConfigTest(seed_test_utils.RepeatableTest):
     self.assertEqual(cfg.scope, compile_lib.Scope.STEP)
     self.assertIsNone(cfg.dynamic)
     self.assertFalse(cfg.fullgraph)
+    self.assertFalse(cfg.spmd_safe)
 
   def test_scope_enum_values(self):
     self.assertEqual(compile_lib.Scope.MODEL.value, "model")
@@ -154,6 +155,49 @@ class CompileConfigTest(seed_test_utils.RepeatableTest):
       compile_lib.CompileConfig().apply(nn.Linear(2, 2), target)
     mock_cfg.assert_called_once()
     self.assertEqual(tc.call_args.kwargs["backend"], "inductor")
+
+  def test_spmd_safe_wraps_step_callable_on_tpu_only(self):
+    def step():
+      return None
+
+    tpu = target_lib.make_target(target_lib.Platform.V5E_1X1)
+    cpu = target_lib.make_target(target_lib.Platform.CPU)
+    cfg = compile_lib.CompileConfig(spmd_safe=True)
+    with (
+        mock.patch("torch.compile") as tc,
+        mock.patch("torch_tpu._internal.compile.TpuBackend"),
+        mock.patch(
+            "torch_tpu._internal.distributed.spmd_util.spmd_safe",
+            return_value="SPMD_SAFE_STEP",
+        ) as mock_spmd,
+    ):
+      cfg.apply(step, cpu)
+      self.assertIs(tc.call_args.args[0], step)
+      mock_spmd.assert_not_called()
+
+      cfg.apply(step, tpu)
+      mock_spmd.assert_called_once_with(step)
+      self.assertEqual(tc.call_args.args[0], "SPMD_SAFE_STEP")
+
+  def test_spmd_safe_wraps_module_forward_on_tpu(self):
+    model = nn.Linear(2, 2)
+    orig_forward = model.forward
+    tpu = target_lib.make_target(target_lib.Platform.V5E_1X1)
+    cfg = compile_lib.CompileConfig(
+        scope=compile_lib.Scope.MODEL, spmd_safe=True
+    )
+    with (
+        mock.patch("torch.compile") as tc,
+        mock.patch("torch_tpu._internal.compile.TpuBackend"),
+        mock.patch(
+            "torch_tpu._internal.distributed.spmd_util.spmd_safe",
+            return_value="SPMD_SAFE_FWD",
+        ) as mock_spmd,
+    ):
+      cfg.apply(model, tpu)
+    mock_spmd.assert_called_once_with(orig_forward)
+    self.assertEqual(model.forward, "SPMD_SAFE_FWD")
+    self.assertIs(tc.call_args.args[0], model)
 
 
 if __name__ == "__main__":

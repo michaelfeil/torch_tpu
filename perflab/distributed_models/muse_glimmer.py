@@ -125,7 +125,7 @@ def build_model(
         "compute_loss": torchtitan_muse_glimmer.cross_entropy_loss,
     },
     compile_config=compile_lib.CompileConfig(
-        scope=compile_lib.Scope.STEP, dynamic=False
+        scope=compile_lib.Scope.STEP, dynamic=False, spmd_safe=True
     ),
     skipped_run_modes={
         "eager_default",

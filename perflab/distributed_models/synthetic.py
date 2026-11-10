@@ -274,7 +274,7 @@ def _register_synthetic_distributed_benchmarks() -> None:
         # `qwen3_8.py`.
         stepper_kwargs={"use_single_trace": False},
         compile_config=compile_lib.CompileConfig(
-            scope=compile_lib.Scope.STEP, dynamic=False
+            scope=compile_lib.Scope.STEP, dynamic=False, spmd_safe=True
         ),
         name=f"synthetic_fsdp_{n}_params_training",
         skipped_run_modes=_EAGER_RUN_MODES,

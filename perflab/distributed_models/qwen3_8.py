@@ -140,11 +140,10 @@ def build_model(
       ),
   )
   if device == target_lib.DeviceKind.TPU.value:
-    # Lets torch_tpu fuse the SimpleFSDP collectives with the surrounding ops
-    # (what torchtitan's TPU `spmd_utils.apply_spmd_safe` does). Under
-    # torch.compile this annotates the traced forward nodes, and AOTAutograd
-    # copies the annotation to their backward nodes (including the gradient
-    # reduce-scatters). `torch.tpu` only exists on TPU, hence the lookup here.
+    # Lets eager TPU runs fuse the SimpleFSDP collectives with the surrounding
+    # ops; compiled Scope.STEP runs also set `CompileConfig(spmd_safe=True)` so
+    # `spmd_safe` covers the whole compiled step (including the loss).
+    # `torch.tpu` only exists on TPU, hence the lookup here.
     model.forward = torch.tpu.distributed.spmd_safe(model.forward)
   return model
 
@@ -171,7 +170,7 @@ def cross_entropy_loss(
         "compute_loss": cross_entropy_loss,
     },
     compile_config=compile_lib.CompileConfig(
-        scope=compile_lib.Scope.STEP, dynamic=False
+        scope=compile_lib.Scope.STEP, dynamic=False, spmd_safe=True
     ),
     # Training is only benchmarked compiled.
     skipped_run_modes={
