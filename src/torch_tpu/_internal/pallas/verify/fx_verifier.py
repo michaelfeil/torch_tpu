@@ -44,10 +44,13 @@ import dataclasses
 import functools
 import importlib
 import inspect
+import io
 import math
 import operator
 import re
 import sys
+import textwrap
+import tokenize
 import types
 from typing import Any
 
@@ -250,6 +253,11 @@ _DOC_TPU_PATTERNS: tuple[tuple[re.Pattern[str], findings.TpuVersion], ...] = (
     ),
 )
 
+_DOC_NEGATION_RE = re.compile(
+    r"\b(?:not|no|except|excluding|unsupported|without|todo)\b",
+    re.IGNORECASE,
+)
+
 # Standard library and framework module prefixes skipped when scanning user
 # kernel modules for docstrings, comments, or `supported_on` predicates.
 _SKIP_MODULE_PREFIXES = (
@@ -284,11 +292,18 @@ _CALLABLE_WRAPPER_ATTRS = (
 def abstract_tpu_device(tpu_version: findings.TpuVersion | str) -> Any:
   """Returns an `AbstractDevice` targeting TPU `tpu_version`."""
   jax_kind = findings.jax_tpu_device_kind(tpu_version)
+  parsed = (
+      findings.parse_tpu_version(tpu_version)
+      if isinstance(tpu_version, str)
+      else tpu_version
+  )
+  # TPU v5p exposes two TensorCores per logical device in Megacore mode.
+  num_cores = 2 if parsed is findings.TpuVersion.V5P else 1
   device_cls = jax.sharding.AbstractDevice
   if "platform" in inspect.signature(device_cls).parameters:
-    return device_cls(jax_kind, 1, "tpu")  # type: ignore[call-arg]
+    return device_cls(jax_kind, num_cores, "tpu")  # type: ignore[call-arg]
   # JAX releases up to 0.9 take no platform argument.
-  return device_cls(jax_kind, 1)  # pyrefly: ignore[missing-argument]
+  return device_cls(jax_kind, num_cores)  # pyrefly: ignore[missing-argument]
 
 
 def abstract_tpu_mesh(tpu_version: findings.TpuVersion | str) -> Any:
@@ -301,11 +316,63 @@ def abstract_tpu_mesh(tpu_version: findings.TpuVersion | str) -> Any:
   )
 
 
+def _strip_python_comments(src: str) -> str:
+  """Strips `#` comments from Python source while preserving punctuation."""
+  dedented = textwrap.dedent(src)
+  lines = dedented.splitlines(keepends=True)
+  comment_spans_by_row: dict[int, list[tuple[int, int]]] = {}
+  try:
+    for tok in tokenize.generate_tokens(io.StringIO(dedented).readline):
+      if tok.type == tokenize.COMMENT:
+        srow, scol = tok.start
+        _, ecol = tok.end
+        comment_spans_by_row.setdefault(srow - 1, []).append((scol, ecol))
+  except (tokenize.TokenError, IndentationError):
+    if not comment_spans_by_row:
+      return "".join(
+          line.split("#", 1)[0]
+          + ("\n" if line.endswith("\n") and "#" in line else "")
+          for line in lines
+      )
+  except SyntaxError:
+    return "".join(
+        line.split("#", 1)[0]
+        + ("\n" if line.endswith("\n") and "#" in line else "")
+        for line in lines
+    )
+  if not comment_spans_by_row:
+    return dedented
+  out_lines = list(lines)
+  for row_idx, spans in comment_spans_by_row.items():
+    if 0 <= row_idx < len(out_lines):
+      line = out_lines[row_idx]
+      for scol, ecol in reversed(spans):
+        line = line[:scol] + line[ecol:]
+      out_lines[row_idx] = line
+  return "".join(out_lines)
+
+
 def _extract_doc_tpu_versions(text: str) -> list[findings.TpuVersion]:
-  """Extracts `TpuVersion` targets mentioned in a docstring."""
-  found: list[findings.TpuVersion] = []
+  """Extracts non-negated `TpuVersion` targets in docstring appearance order."""
+  matches: list[tuple[int, findings.TpuVersion]] = []
   for pattern, canonical in _DOC_TPU_PATTERNS:
-    if pattern.search(text) and canonical not in found:
+    for match in pattern.finditer(text):
+      line_start = text.rfind("\n", 0, match.start()) + 1
+      clause_prefix = re.split(
+          r"[.;:]", text[max(line_start, match.start() - 48) : match.start()]
+      )[-1]
+      clause_tail = re.split(r"[.;:\n]", text[match.end() : match.end() + 32])[
+          0
+      ]
+      if _DOC_NEGATION_RE.search(clause_prefix) or re.search(
+          r"\btodo\b", clause_tail, re.IGNORECASE
+      ):
+        continue
+      matches.append((match.start(), canonical))
+  matches.sort(key=lambda item: item[0])
+  found: list[findings.TpuVersion] = []
+  for _, canonical in matches:
+    if canonical not in found:
       found.append(canonical)
   return found
 
@@ -344,6 +411,10 @@ def _iter_callable_children(obj: Any) -> Iterator[Any]:
   elif isinstance(obj, functools.partial):
     yield from obj.args
     yield from (obj.keywords or {}).values()
+  elif isinstance(obj, (tuple, list, set, frozenset)):
+    yield from obj
+  elif isinstance(obj, Mapping):
+    yield from obj.values()
   elif isinstance(obj, types.FunctionType):
     for cell in obj.__closure__ or ():
       try:
@@ -356,8 +427,16 @@ def _iter_callable_children(obj: Any) -> Iterator[Any]:
       yield d
 
 
+def _iter_code_names(code: types.CodeType) -> Iterator[str]:
+  """Yields global names referenced by `code` and nested code constants."""
+  yield from code.co_names
+  for const in code.co_consts:
+    if isinstance(const, types.CodeType):
+      yield from _iter_code_names(const)
+
+
 def _collect_callable_objects(
-    op_or_fn: Any, *, max_objects: int = 64
+    op_or_fn: Any, *, max_objects: int = 96
 ) -> list[Any]:
   """Collects reachable functions and callable wrappers starting from `op_or_fn`."""
   queue: list[Any] = [op_or_fn]
@@ -392,7 +471,7 @@ def _collect_callable_objects(
       mod_name = getattr(obj, "__module__", "") or ""
       if not mod_name.startswith(_SKIP_MODULE_PREFIXES):
         gdict = getattr(obj, "__globals__", None) or {}
-        for name in obj.__code__.co_names:
+        for name in _iter_code_names(obj.__code__):
           gval = gdict.get(name)
           if extract_jax_callable(gval) is not None or (
               isinstance(gval, (types.FunctionType, type))
@@ -447,7 +526,7 @@ def _collect_kernel_metadata(
     visited_objs: Sequence[Any],
     modules: Sequence[types.ModuleType],
 ) -> tuple[list[Callable[[Any], Any]], list[str], list[str]]:
-  """Extracts `(supported_on_fns, doc_texts, source_texts)` from kernel objects."""
+  """Extracts `(supported_on_fns, doc_texts, sources)` from kernel objects."""
   supported_on_fns: list[Callable[[Any], Any]] = []
   doc_texts: list[str] = []
   source_texts: list[str] = []
@@ -556,10 +635,7 @@ def infer_explicit_tpu_version(
 
   # 2. Restrict to TPU generations with SparseCore hardware if the kernel source
   # uses SparseCore APIs.
-  if any(
-      ".sparse_core" in src or "pallas.tpu_sc" in src or "import tpu_sc" in src
-      for src in source_texts
-  ):
+  if _sources_use_sparse_core(source_texts):
     sc_allowed = [v for v in allowed if v in _SPARSE_CORE_TPU_VERSIONS]
     if sc_allowed:
       allowed = sc_allowed
@@ -578,6 +654,22 @@ def infer_explicit_tpu_version(
         DEFAULT_TPU_VERSION if DEFAULT_TPU_VERSION in allowed else allowed[-1]
     )
   return None
+
+
+def _sources_use_sparse_core(source_texts: Sequence[str]) -> bool:
+  stripped_sources = [_strip_python_comments(src) for src in source_texts]
+  return any(
+      ".sparse_core" in src or "pallas.tpu_sc" in src or "import tpu_sc" in src
+      for src in stripped_sources
+  )
+
+
+def _function_uses_sparse_core(op_or_fn: Any) -> bool:
+  """Returns whether `op_or_fn` or its helpers invoke SparseCore APIs."""
+  visited_objs = _collect_callable_objects(op_or_fn)
+  modules = _collect_user_modules(visited_objs)
+  _, _, source_texts = _collect_kernel_metadata(visited_objs, modules)
+  return _sources_use_sparse_core(source_texts)
 
 
 def infer_tpu_version(

@@ -1314,6 +1314,36 @@ class FxVerifierTest(seed_test_utils.RepeatableTest):
     )
     self.assertTrue(rep.passed, msg=rep.summary())
 
+  def test_docstring_negation_and_comments_ignored_in_tpu_inference(self):
+    def _tc_only_fn(x: jax.Array) -> jax.Array:
+      """Runs on TPU v6e TensorCore (does not use SparseCore)."""
+      # Note: pltpu.sparse_core on v5e/v5p is not used here.
+      return _pallas_add_one(x)
+
+    def _sc_real_fn(x: jax.Array) -> jax.Array:
+      _ = (
+          getattr(pltpu, "sparse_core", None)
+          or pltpu.CoreType.SC_SCALAR_SUBCORE
+      )
+      # Keep real attribute punctuation:
+      if hasattr(pltpu, "sparse_core"):
+        _ = pltpu.sparse_core
+      return _pallas_add_one(x)
+
+    self.assertFalse(fx_verifier._function_uses_sparse_core(_tc_only_fn))
+    self.assertTrue(fx_verifier._function_uses_sparse_core(_sc_real_fn))
+    self.assertEqual(
+        fx_verifier._extract_doc_tpu_versions(
+            "Optimized for TPU v6e; baseline compared against TPU v5e."
+        ),
+        [torch.tpu.TpuVersion.V6E, torch.tpu.TpuVersion.V5E],
+    )
+    self.assertIs(
+        fx_verifier.infer_tpu_version(_tc_only_fn), torch.tpu.TpuVersion.V6E
+    )
+    self.assertEqual(fx_verifier.abstract_tpu_device("v5p").num_cores, 2)
+    self.assertEqual(fx_verifier.abstract_tpu_device("v6e").num_cores, 1)
+
 
 if __name__ == "__main__":
   absltest.main()
