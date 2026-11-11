@@ -512,6 +512,8 @@ def test_required_regexp_by_line() -> None:
 def test_required_regexp_entire_file() -> None:
   ok = 'load("//x")\n\ntorch_tpu_package_end()\n'
   assert not _check("CheckTorchTpuPackageEnd", ok, "csrc/BUILD")
+  suppressed = "# NO_TORCH_TPU_PACKAGE_END_OK=reason\nfoo()\n"
+  assert not _check("CheckTorchTpuPackageEnd", suppressed, "csrc/BUILD")
   bad = "torch_tpu_package_end()\nfoo()\n"
   assert _lines(_check("CheckTorchTpuPackageEnd", bad, "csrc/BUILD")) == [None]
 
@@ -587,6 +589,32 @@ def test_file_operation_rule() -> None:
   )
   assert not _check("CheckOpFileName", "x\n", rel)
 
+  op_rule = custom_lint_metadata.Rule(
+      id="SyntheticFileOpRule",
+      path_regex=r".*\.cc$",
+      failure_message="disallowed file op",
+      operations=frozenset({custom_lint_metadata.FileOperation.ADD}),
+      kind=custom_lint_metadata.CheckKind.CHECK_FILE_OPERATION,
+  )
+  assert _lines(
+      custom_lint.check_file_content(
+          "x\n",
+          rel,
+          op_rule,
+          custom_lint_vcs.ModifiedLines({rel: {1}}),
+          canonical_path=_project_mapper().to_canonical(rel),
+          file_operation=custom_lint_metadata.FileOperation.ADD,
+      )
+  ) == [None]
+  assert not custom_lint.check_file_content(
+      "x\n",
+      rel,
+      op_rule,
+      custom_lint_vcs.ModifiedLines({rel: {1}}),
+      canonical_path=_project_mapper().to_canonical(rel),
+      file_operation=custom_lint_metadata.FileOperation.EDIT,
+  )
+
 
 def test_operation_is_read_from_modified_lines() -> None:
   rel = "csrc/ops/addkernel.cc"
@@ -619,6 +647,7 @@ _RULE_EXAMPLES: Final[Mapping[str, _RuleExample]] = {
     "CheckCopybaraTags": _RuleExample(
         path="a.py",
         bad="# copybara:" + "strip\n",
+        good="# copybara:" + "strip  # ALLOW_IRREVERSIBLE_TRANSFORM=r\n",
     ),
     "CheckPythonEnvAccess": _RuleExample(
         path="ops/a.py",
@@ -633,11 +662,13 @@ _RULE_EXAMPLES: Final[Mapping[str, _RuleExample]] = {
     "CheckOpFileName": _RuleExample(
         path="csrc/ops/addkernel.cc",
         bad="x\n",
+        good="// ALLOW_SINGULAR_KERNEL_FILENAME=r\n",
         op=custom_lint_metadata.FileOperation.ADD,
     ),
     "CheckOpImplFilename": _RuleExample(
         path="csrc/ops/add/helper.cc",
         bad="x\n",
+        good="// ALLOW_ANY_OP_IMPL_FILENAME=r\n",
         op=custom_lint_metadata.FileOperation.ADD,
     ),
     "CheckKernelMacro": _RuleExample(
@@ -653,15 +684,20 @@ _RULE_EXAMPLES: Final[Mapping[str, _RuleExample]] = {
     "CheckC10ToStringUsage": _RuleExample(
         path="csrc/a.cc",
         bad="c10::toString(x);\n",
-        good="c10::toString(x);  // C10_TOSTRING_OK\n",
+        good="c10::toString(x);  // C10_TOSTRING_OK=r\n",
     ),
     "CheckDeprecatedMutexLock": _RuleExample(
         path="csrc/a.cc",
         bad="MutexLock lock(&mu);\n",
+        good="MutexLock lock(&mu);  // DEPRECATED_MUTEX_LOCK_OK=r\n",
     ),
     "CheckIgnoreInCacheKeyLegacy": _RuleExample(
         path="csrc/a.cc",
         bad='IgnoreInCacheKey(x, "Legacy usage");\n',
+        good=(
+            'IgnoreInCacheKey(x, "Legacy usage");'
+            "  // IGNORE_IN_CACHE_KEY_LEGACY_OK=r\n"
+        ),
     ),
     "CheckIncludeBeforeCopyright": _RuleExample(
         path="csrc/a.cc",
@@ -783,7 +819,7 @@ _RULE_EXAMPLES: Final[Mapping[str, _RuleExample]] = {
     "CheckNoVoidCast": _RuleExample(
         path="csrc/a.cc",
         bad="(void)foo();\n",
-        good="(void)foo();  // VOID_CAST_OK\n",
+        good="(void)foo();  // VOID_CAST_OK=r\n",
     ),
     "CheckIgnoreError": _RuleExample(
         path="csrc/a.cc",
