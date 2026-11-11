@@ -69,23 +69,25 @@ std::optional<int64_t> PyGetIntegerEnvOnce(
     std::string_view name, std::optional<int64_t> default_value) {
   std::optional<int64_t> value;
   if (name == kLocalRankEnvVar) {
-    value = GetIntegerEnvOnce<int, kLocalRankEnvVar>();
+    value = GetIntegerEnvOnce<kLocalRankEnvVar>();
+  } else if (name == kMasterPortEnvVar) {
+    value = GetIntegerEnvOnce<kMasterPortEnvVar>();
   } else if (name == kRankEnvVar) {
-    value = GetIntegerEnvOnce<int, kRankEnvVar>();
+    value = GetIntegerEnvOnce<kRankEnvVar>();
   } else if (name == kTorchTpuBasePortEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchTpuBasePortEnvVar>();
+    value = GetIntegerEnvOnce<kTorchTpuBasePortEnvVar>();
   } else if (name == kTorchTpuDevicesPerHostEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchTpuDevicesPerHostEnvVar>();
+    value = GetIntegerEnvOnce<kTorchTpuDevicesPerHostEnvVar>();
   } else if (name == kTorchTpuHandshakePortEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchTpuHandshakePortEnvVar>();
+    value = GetIntegerEnvOnce<kTorchTpuHandshakePortEnvVar>();
   } else if (name == kTorchTpuInternalHandshakeTimeoutSEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchTpuInternalHandshakeTimeoutSEnvVar>();
+    value = GetIntegerEnvOnce<kTorchTpuInternalHandshakeTimeoutSEnvVar>();
   } else if (name == kTorchcommRankEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchcommRankEnvVar>();
+    value = GetIntegerEnvOnce<kTorchcommRankEnvVar>();
   } else if (name == kTorchcommSizeEnvVar) {
-    value = GetIntegerEnvOnce<int, kTorchcommSizeEnvVar>();
+    value = GetIntegerEnvOnce<kTorchcommSizeEnvVar>();
   } else if (name == kWorldSizeEnvVar) {
-    value = GetIntegerEnvOnce<int, kWorldSizeEnvVar>();
+    value = GetIntegerEnvOnce<kWorldSizeEnvVar>();
   } else {
     ABSL_LOG(FATAL)  // CRASH_OK=TorchTPU bug
         << "Before reading integer environment variable " << name
@@ -105,8 +107,6 @@ std::optional<std::string> PyGetStringEnvOnce(
     value = GetEnvOnce<kJobCompletionIndexEnvVar>();
   } else if (name == kMasterAddrEnvVar) {
     value = GetEnvOnce<kMasterAddrEnvVar>();
-  } else if (name == kMasterPortEnvVar) {
-    value = GetEnvOnce<kMasterPortEnvVar>();
   } else if (name == kNnodesEnvVar) {
     value = GetEnvOnce<kNnodesEnvVar>();
   } else if (name == kNodeRankEnvVar) {
