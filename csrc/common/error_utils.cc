@@ -38,6 +38,8 @@
 
 #include "ATen/core/ATen_fwd.h"
 #include "ATen/core/TensorBody.h"
+#include "absl/base/no_destructor.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "absl/numeric/int128.h"
@@ -48,10 +50,12 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/strip.h"
 #include "absl/strings/substitute.h"
 #include "absl/types/span.h"
 #include "c10/core/Device.h"
 #include "c10/core/DeviceGuard.h"
+#include "c10/core/ScalarType.h"
 #include "c10/core/WrapDimMinimal.h"
 #include "c10/core/impl/DeviceGuardImplInterface.h"
 #include "c10/util/ArrayRef.h"  // IWYU pragma: keep for IntArrayRef
@@ -361,6 +365,142 @@ std::optional<std::string> ValidateNoStableHloTypeName(
   return std::nullopt;
 }
 
+// Maps the legacy name of each dtype, i.e. the name of its c10::ScalarType
+// enumerator (e.g. "Long"), which is what streaming a c10::ScalarType prints,
+// to its PyTorch dtype name (e.g. "int64"). Derived from c10 so that it's
+// always in sync with it.
+[[nodiscard]] const absl::flat_hash_map<std::string_view, std::string_view>&
+GetLegacyToTorchDtypeNames() {
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string_view, std::string_view>>
+      kNames([] {
+        absl::flat_hash_map<std::string_view, std::string_view> names;
+        // The c10::ScalarType enumerators are contiguous, starting at 0, with
+        // `Undefined` right after the last valid one.
+        for (int i = 0; i < static_cast<int>(c10::ScalarType::Undefined); ++i) {
+          const auto scalar_type = static_cast<c10::ScalarType>(i);
+          // c10's string for a ScalarType is its legacy name, which is exactly
+          // what we need here, so torch_tpu::ToString() doesn't apply.
+          const char* const legacy =
+              c10::toString(scalar_type);  // C10_TOSTRING_OK=need legacy name
+          names.emplace(legacy, c10::getDtypeNames(scalar_type).first);
+        }
+        return names;
+      }());
+  return *kNames;
+}
+
+// Validates that the message shows dtypes by their official PyTorch names, as
+// opposed to their legacy c10::ScalarType names, which streaming a
+// c10::ScalarType produces:
+//     - "int64" vs. "Long"
+//     - "float32" vs. "Float"
+//     - "bool" vs. "Bool"
+//     - "complex64" vs. "ComplexFloat".
+//
+// Pre-conditions: The error message must not be empty.
+//
+// The legacy names are matched as whole words and case-sensitively, so the
+// PyTorch names (e.g. "bool", "bfloat16") and identifiers that merely contain a
+// legacy name (e.g. "IntArrayRef", "kLong") are not flagged.
+std::optional<std::string> ValidateNoLegacyScalarTypeName(
+    const std::string_view message) {
+  ABSL_CHECK(  // CRASH_OK
+      !message.empty())
+      << kErrorMessageCheckPreconditionViolated;
+
+  // Captures the legacy name, e.g. "\b(Byte|Char|...)\b".
+  static const absl::NoDestructor<RE2> kLegacyNamePattern(absl::StrCat(
+      "\\b(",
+      absl::StrJoin(GetLegacyToTorchDtypeNames(), "|",
+                    [](std::string* out, const auto& legacy_and_torch) {
+                      absl::StrAppend(out, legacy_and_torch.first);
+                    }),
+      ")\\b"));
+  ABSL_CHECK(kLegacyNamePattern->ok())  // CRASH_OK
+      << kErrorMessageCheckPreconditionViolated;
+
+  std::vector<std::string> replacements;
+  std::string_view input = message;
+  std::string_view legacy;
+  while (RE2::FindAndConsume(&input, *kLegacyNamePattern, &legacy)) {
+    const auto it = GetLegacyToTorchDtypeNames().find(legacy);
+    ABSL_CHECK(it != GetLegacyToTorchDtypeNames().end())  // CRASH_OK
+        << kErrorMessageCheckPreconditionViolated;
+    replacements.push_back(
+        absl::StrCat("'", it->first, "' with '", it->second, "'"));
+  }
+
+  if (!replacements.empty()) {
+    return absl::StrCat(
+        "The error message must use the PyTorch dtype names instead of the "
+        "legacy c10::ScalarType names. Replace ",
+        absl::StrJoin(replacements, ", "),
+        ". Use ToString(at::ScalarType) for retrieving the PyTorch dtype "
+        "name.");
+  }
+  return std::nullopt;
+}
+
+// Validates that the message writes the PyTorch dtype names plainly, i.e.
+// without the "torch." prefix and without quotes:
+//     - "int32" vs. "torch.int32"
+//     - "float32" vs. "'float32'", "\"float32\"" or "`float32`".
+//
+// Pre-conditions: The error message must not be empty.
+//
+// Backticks are rejected along with single and double quotes, since they are
+// just another way of quoting. Quotes are only flagged when they immediately
+// enclose a dtype name (optionally with the "torch." prefix), so quoted strings
+// that merely contain one (e.g. "'int32 tensor'") are not flagged. The dtype
+// names are matched as whole words, so identifiers that merely start with one
+// (e.g. "int32_t", "torch.int32x") are not flagged either.
+std::optional<std::string> ValidateNoPrefixedOrQuotedDtypeName(
+    const std::string_view message) {
+  ABSL_CHECK(  // CRASH_OK
+      !message.empty())
+      << kErrorMessageCheckPreconditionViolated;
+
+  // Captures the prefixed or quoted dtype name, e.g. "torch.int32" or
+  // "'int32'".
+  static const absl::NoDestructor<RE2> kPrefixedOrQuotedNamePattern([] {
+    const std::string names =
+        absl::StrJoin(GetLegacyToTorchDtypeNames(), "|",
+                      [](std::string* out, const auto& legacy_and_torch) {
+                        absl::StrAppend(out, legacy_and_torch.second);
+                      });
+    return absl::Substitute(
+        R"re(('(?:torch\.)?(?:$0)'|"(?:torch\.)?(?:$0)"|`(?:torch\.)?(?:$0)`)re"
+        R"re(|\btorch\.(?:$0)\b))re",
+        names);
+  }());
+  ABSL_CHECK(kPrefixedOrQuotedNamePattern->ok())  // CRASH_OK
+      << kErrorMessageCheckPreconditionViolated;
+
+  std::vector<std::string> replacements;
+  std::string_view input = message;
+  std::string_view prefixed_or_quoted;
+  while (RE2::FindAndConsume(&input, *kPrefixedOrQuotedNamePattern,
+                             &prefixed_or_quoted)) {
+    // Strip the quotes, if any, and then the "torch." prefix, if any.
+    std::string_view name = prefixed_or_quoted;
+    if (!absl::StartsWith(name, "torch.")) {
+      name = name.substr(1, name.size() - 2);
+    }
+    absl::ConsumePrefix(&name, "torch.");
+    replacements.push_back(
+        absl::StrCat("'", prefixed_or_quoted, "' with '", name, "'"));
+  }
+
+  if (!replacements.empty()) {
+    return absl::StrCat(
+        "The error message must write the PyTorch dtype names plainly, without "
+        "the 'torch.' prefix or quotes. Replace ",
+        absl::StrJoin(replacements, ", "), ".");
+  }
+  return std::nullopt;
+}
+
 // Validates that the message writes the dimensionality of tensors as "<N>D"
 // when it's a number (e.g. "0D", "5D"), and as "<n>-D" when it's a single
 // letter (e.g. "n-D", "N-D").
@@ -591,6 +731,17 @@ class ErrorFormatChecker {
     // project might contain StableHLO type names, but we don't have control
     // over it.)
     CheckNoStableHloTypeName(to_check);
+
+    // Likewise for the legacy c10::ScalarType names. (Error messages coming
+    // from the OpenXLA project are not under our control.)
+    if (!to_check.empty()) {
+      AppendIfViolation(ValidateNoLegacyScalarTypeName(to_check));
+    }
+
+    // Likewise for the "torch." prefix and quotes around dtype names.
+    if (!to_check.empty()) {
+      AppendIfViolation(ValidateNoPrefixedOrQuotedDtypeName(to_check));
+    }
 
     // The dimensionality format applies to the whole TorchTPU part of the
     // message, including the context prefixes. (The XLA compiler error is not

@@ -1617,6 +1617,107 @@ TEST_F(ErrorMessageGuidelinesDeathTest,
                      Not(HasSubstr("instead of 'i8'"))));
 }
 
+TEST_F(ErrorMessageGuidelinesDeathTest, ContainsLegacyScalarTypeName) {
+  EXPECT_DEATH(ThrowWithMessage("expected index dtype to be Long, got int32"),
+               AllOf(HasSubstr("legacy c10::ScalarType names"),
+                     HasSubstr("Replace 'Long' with 'int64'")));
+  // Quoted.
+  EXPECT_DEATH(ThrowWithMessage("not implemented for 'ComplexFloat'"),
+               HasSubstr("Replace 'ComplexFloat' with 'complex64'"));
+  // All the violations are listed.
+  EXPECT_DEATH(
+      ThrowWithMessage("expected q and k to share a dtype, got Float and "
+                       "BFloat16"),
+      HasSubstr("Replace 'Float' with 'float32', 'BFloat16' with 'bfloat16'"));
+  // On context prefix.
+  EXPECT_DEATH(
+      ThrowWithMessage("failed to copy Half tensor: dimension size negative"),
+      HasSubstr("Replace 'Half' with 'float16'"));
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest,
+       LegacyScalarTypeNameIsReplacedWithTorchDtypeName) {
+  using NamePair = std::pair<std::string_view, std::string_view>;
+  constexpr NamePair kLegacyToTorchNames[] = {
+      // go/keep-sorted start
+      {"BFloat16", "bfloat16"},
+      {"Bool", "bool"},
+      {"Byte", "uint8"},
+      {"Char", "int8"},
+      {"ComplexDouble", "complex128"},
+      {"ComplexFloat", "complex64"},
+      {"ComplexHalf", "complex32"},
+      {"Double", "float64"},
+      {"Float", "float32"},
+      {"Float8_e4m3fn", "float8_e4m3fn"},
+      {"Half", "float16"},
+      {"Int", "int32"},
+      {"Int4", "int4"},
+      {"Long", "int64"},
+      {"Short", "int16"},
+      {"UInt16", "uint16"},
+      // go/keep-sorted end
+  };
+  for (const auto& [legacy, torch] : kLegacyToTorchNames) {
+    EXPECT_DEATH(
+        ThrowWithMessage(absl::StrCat("unsupported dtype ", legacy)),
+        HasSubstr(absl::StrCat("Replace '", legacy, "' with '", torch, "'")));
+  }
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest, ContainsTorchPrefixedDtypeName) {
+  EXPECT_DEATH(
+      ThrowWithMessage("expected index dtype to be torch.int64, got int32"),
+      AllOf(HasSubstr("must write the PyTorch dtype names plainly"),
+            HasSubstr("Replace 'torch.int64' with 'int64'")));
+  EXPECT_DEATH(ThrowWithMessage("expected dtype=torch.float32, got bfloat16"),
+               HasSubstr("Replace 'torch.float32' with 'float32'"));
+  // On context prefix.
+  EXPECT_DEATH(ThrowWithMessage("failed to copy torch.float16 tensor: "
+                                "dimension size negative"),
+               HasSubstr("Replace 'torch.float16' with 'float16'"));
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest, ContainsQuotedDtypeName) {
+  EXPECT_DEATH(ThrowWithMessage("unsupported input dtype: 'int32'"),
+               AllOf(HasSubstr("must write the PyTorch dtype names plainly"),
+                     HasSubstr("Replace ''int32'' with 'int32'")));
+  EXPECT_DEATH(ThrowWithMessage("unsupported input dtype: \"float32\""),
+               HasSubstr("Replace '\"float32\"' with 'float32'"));
+  EXPECT_DEATH(ThrowWithMessage("unsupported input dtype: `bool`"),
+               HasSubstr("Replace '`bool`' with 'bool'"));
+  EXPECT_DEATH(ThrowWithMessage("unsupported input dtype: 'torch.int32'"),
+               HasSubstr("Replace ''torch.int32'' with 'int32'"));
+  // All the violations are listed.
+  EXPECT_DEATH(
+      ThrowWithMessage("expected 'int32' or \"float32\", got torch.bool"),
+      HasSubstr("Replace ''int32'' with 'int32', '\"float32\"' with "
+                "'float32', 'torch.bool' with 'bool'"));
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest,
+       TorchPrefixedOrQuotedDtypeNameIsReplacedWithPlainName) {
+  // The dtype names come from c10, so every PyTorch dtype is covered.
+  constexpr std::string_view kTorchNames[] = {
+      // go/keep-sorted start
+      "bfloat16",  "bool",          "complex128",  "complex32",
+      "complex64", "float16",       "float32",     "float4_e2m1fn_x2",
+      "float64",   "float8_e4m3fn", "float8_e5m2", "int16",
+      "int32",     "int4",          "int64",       "int8",
+      "qint8",     "uint16",        "uint8",
+      // go/keep-sorted end
+  };
+  for (const std::string_view torch : kTorchNames) {
+    EXPECT_DEATH(
+        ThrowWithMessage(absl::StrCat("unsupported dtype torch.", torch)),
+        HasSubstr(
+            absl::StrCat("Replace 'torch.", torch, "' with '", torch, "'")));
+    EXPECT_DEATH(
+        ThrowWithMessage(absl::StrCat("unsupported dtype '", torch, "'")),
+        HasSubstr(absl::StrCat("Replace ''", torch, "'' with '", torch, "'")));
+  }
+}
+
 TEST_F(ErrorMessageGuidelinesDeathTest, NonAlphaNumTrailingChar) {
   EXPECT_DEATH(ThrowWithMessage("dimension size negative."),
                HasSubstr("end with either an alpha-numeric"));
@@ -1741,6 +1842,82 @@ TEST_F(ErrorMessageGuidelinesPassTest, StableHloTypeNameOnXlaError) {
   EXPECT_THROW(ThrowWithContextForXlaError(
                    /* context= */ "the task has failed",
                    /* xla_error_message= */ "the dtype cannot be f32"),
+               c10::Error);
+}
+
+TEST_F(ErrorMessageGuidelinesPassTest, LegacyScalarTypeNameOnXlaError) {
+  // The XLA compiler error is not under our control, so it may contain legacy
+  // c10::ScalarType names.
+  EXPECT_THROW(ThrowWithContextForXlaError(
+                   /* context= */ "the task has failed",
+                   /* xla_error_message= */ "the dtype cannot be Float"),
+               c10::Error);
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest, LegacyScalarTypeNameBeforeXlaError) {
+  EXPECT_DEATH(ThrowWithContextForXlaError(
+                   /* context= */ "failed to compile Float tensor",
+                   /* xla_error_message= */ "unknown error"),
+               HasSubstr("Replace 'Float' with 'float32'"));
+}
+
+TEST_F(ErrorMessageGuidelinesPassTest,
+       TorchPrefixedOrQuotedDtypeNameOnXlaError) {
+  // The XLA compiler error is not under our control, so it may contain
+  // decorated dtype names.
+  EXPECT_THROW(
+      ThrowWithContextForXlaError(
+          /* context= */ "the task has failed",
+          /* xla_error_message= */ "the dtype cannot be 'torch.int32'"),
+      c10::Error);
+}
+
+TEST_F(ErrorMessageGuidelinesDeathTest,
+       TorchPrefixedOrQuotedDtypeNameBeforeXlaError) {
+  EXPECT_DEATH(ThrowWithContextForXlaError(
+                   /* context= */ "failed to compile 'int32' tensor",
+                   /* xla_error_message= */ "unknown error"),
+               HasSubstr("Replace ''int32'' with 'int32'"));
+}
+
+TEST_F(ErrorMessageGuidelinesPassTest, TorchDtypeNames) {
+  // The check is case-sensitive: the torch dtype names (e.g. "bool",
+  // "bfloat16") are allowed, but not the legacy names (e.g. "Bool",
+  // "BFloat16").
+  EXPECT_THROW(ThrowWithMessage("expected index dtype to be int64, got bool"),
+               c10::Error);
+  EXPECT_THROW(
+      ThrowWithMessage("expected bfloat16 or float32 inputs, got complex64"),
+      c10::Error);
+}
+
+TEST_F(ErrorMessageGuidelinesPassTest,
+       LegacyScalarTypeNameLookalikesAreAllowed) {
+  // Only whole legacy names are matched, so identifiers and words that merely
+  // contain one (e.g. "IntArrayRef", "LongTensor", "kFloat", "Integer") or
+  // that are not legacy names (e.g. "Float8", "Int64") are not flagged.
+  EXPECT_THROW(ThrowWithMessage("expected an IntArrayRef or a LongTensor, got "
+                                "at::kFloat"),
+               c10::Error);
+  EXPECT_THROW(ThrowWithMessage("TorchTPU does not support Integer, Float8 or "
+                                "Int64 types"),
+               c10::Error);
+}
+
+TEST_F(ErrorMessageGuidelinesPassTest,
+       TorchPrefixedOrQuotedDtypeNameLookalikesAreAllowed) {
+  // Only whole dtype names are matched, so C++ types and other identifiers
+  // that merely start with one (e.g. "int32_t", "torch.int32x") are not
+  // flagged.
+  EXPECT_THROW(ThrowWithMessage("expected 'int32_t' or torch.int32_t, got "
+                                "torch.int32x"),
+               c10::Error);
+  // Quoted strings that aren't exactly a dtype name are not flagged.
+  EXPECT_THROW(ThrowWithMessage("expected an 'int32 tensor' or \"bool mask\", "
+                                "got `torch.select` and 'tpu'"),
+               c10::Error);
+  // "torch." must be a whole word.
+  EXPECT_THROW(ThrowWithMessage("unsupported dtype my_torch.int32"),
                c10::Error);
 }
 
