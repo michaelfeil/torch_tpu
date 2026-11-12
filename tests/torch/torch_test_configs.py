@@ -122,6 +122,11 @@ TEST_EXCLUSIONS: Final[
             "test_synchronize_explicit_none_matches_no_arg",
         ],
     },
+    "functorch/test_aot_joint_with_descriptors": {
+        "TestAOTJointWithDescriptorsDevice": [
+            "test_preserve_annotate_flex_attention",
+        ],
+    },
     "functorch/test_eager_transforms": {
         "TestCompileTransforms": [
             "test_compile_dynamic_grad_vjp_trace_pytree",
